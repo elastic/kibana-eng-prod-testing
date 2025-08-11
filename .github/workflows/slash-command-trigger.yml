@@ -1,4 +1,4 @@
-name: 'Eng Prod Commands Handler'
+name: 'Slash Command Test Plan'
 
 on:
   issue_comment:
