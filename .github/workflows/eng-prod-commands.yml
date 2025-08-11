@@ -1,0 +1,356 @@
+name: 'Eng Prod Commands Handler'
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  handle-slash-command:
+    runs-on: ubuntu-latest
+
+    # Only trigger on PR comments containing slash commands
+    if: >
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/test-plan') ||
+       contains(github.event.comment.body, '/e2e-plan') ||
+       contains(github.event.comment.body, '/functional-tests') ||
+       contains(github.event.comment.body, '/generate-docs'))
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse slash command
+        id: parse-command
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+            const lines = comment.split('\n');
+            const commandLine = lines.find(line => {
+              const trimmed = line.trim();
+              return trimmed.startsWith('/test-plan') ||
+                     trimmed.startsWith('/e2e-plan') ||
+                     trimmed.startsWith('/functional-tests') ||
+                     trimmed.startsWith('/generate-docs');
+            });
+
+            if (!commandLine) {
+              core.setFailed('No valid slash command found');
+              return;
+            }
+
+            // Parse command arguments
+            const parts = commandLine.trim().split(/\s+/);
+            const command = parts[0];
+
+            let preset = 'agile';
+            let maxTests = '25';
+            let enableDocs = false;
+            let enableMcp = false;
+            let docType = 'user_guide';
+            let audience = 'developer';
+            let contentLength = 'standard';
+
+            // Set defaults for documentation commands
+            if (command === '/generate-docs') {
+              enableDocs = true;
+              enableMcp = true; // Enable MCP by default for docs
+            }
+
+            for (let i = 1; i < parts.length; i++) {
+              if (parts[i] === '--preset' && i + 1 < parts.length) {
+                preset = parts[i + 1];
+                i++;
+              } else if (parts[i] === '--max-tests' && i + 1 < parts.length) {
+                maxTests = parts[i + 1];
+                i++;
+              } else if (parts[i] === '--docs') {
+                enableDocs = true;
+              } else if (parts[i] === '--enhance') {
+                enableMcp = true;
+              } else if (parts[i] === '--doc-type' && i + 1 < parts.length) {
+                docType = parts[i + 1];
+                i++;
+              } else if (parts[i] === '--audience' && i + 1 < parts.length) {
+                audience = parts[i + 1];
+                i++;
+              } else if (parts[i] === '--content-length' && i + 1 < parts.length) {
+                contentLength = parts[i + 1];
+                i++;
+              }
+            }
+
+            core.setOutput('preset', preset);
+            core.setOutput('max_tests', maxTests);
+            core.setOutput('enable_docs', enableDocs);
+            core.setOutput('enable_mcp', enableMcp);
+            core.setOutput('doc_type', docType);
+            core.setOutput('audience', audience);
+            core.setOutput('content_length', contentLength);
+            core.setOutput('command_type', command);
+
+      - name: React with eyes to acknowledge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      # MCP Server configuration is handled automatically by the action
+
+      - name: Pre-warm ELSER model (Elastic Cloud fix)
+        if: ${{ vars.MCP_TECHNICAL_WRITER_ENABLED == 'true' }}
+        continue-on-error: true
+        run: |
+          echo "🔄 Pre-warming ELSER model for Elastic Cloud..."
+
+          # Check if model is already running
+          MODEL_STATUS=$(curl -s -X GET "${{ secrets.ELASTICSEARCH_HOST }}/_ml/trained_models/.elser-2/_stats" \
+            -u "${{ secrets.ELASTICSEARCH_USERNAME }}:${{ secrets.ELASTICSEARCH_PASSWORD }}" \
+            -H "Content-Type: application/json" | jq -r '.trained_model_stats[0].deployment_stats.state // "not_found"' || echo "error")
+
+          echo "📊 Current ELSER model status: $MODEL_STATUS"
+
+          if [[ "$MODEL_STATUS" != "started" ]]; then
+            echo "🚀 Starting ELSER model..."
+            curl -s -X POST "${{ secrets.ELASTICSEARCH_HOST }}/_ml/trained_models/.elser-2/deployment/_start" \
+              -u "${{ secrets.ELASTICSEARCH_USERNAME }}:${{ secrets.ELASTICSEARCH_PASSWORD }}" \
+              -H "Content-Type: application/json" || echo "⚠️ Model start request failed (might already be starting)"
+
+            echo "⏳ Waiting 30 seconds for model to initialize..."
+            sleep 30
+
+            # Check final status
+            FINAL_STATUS=$(curl -s -X GET "${{ secrets.ELASTICSEARCH_HOST }}/_ml/trained_models/.elser-2/_stats" \
+              -u "${{ secrets.ELASTICSEARCH_USERNAME }}:${{ secrets.ELASTICSEARCH_PASSWORD }}" \
+              -H "Content-Type: application/json" | jq -r '.trained_model_stats[0].deployment_stats.state // "unknown"' || echo "error")
+
+            echo "✅ ELSER model final status: $FINAL_STATUS"
+          else
+            echo "✅ ELSER model already running"
+          fi
+
+      - name: Generate test plan or documentation from slash command
+        id: test-plan
+        uses: elastic/test-plan-generator@github-action
+        with:
+          repository: ${{ github.repository }}
+          pr-number: ${{ github.event.issue.number }}
+          preset: ${{ steps.parse-command.outputs.preset }}
+          max-tests: ${{ steps.parse-command.outputs.max_tests }}
+          enable-ai: 'true'
+          # MCP is handled internally by the Docker container
+          enable-mcp: ${{ steps.parse-command.outputs.enable_mcp }}
+          generate-docs: ${{ steps.parse-command.outputs.enable_docs }}
+          doc-type: ${{ steps.parse-command.outputs.doc_type }}
+          audience: ${{ steps.parse-command.outputs.audience }}
+          content-length: ${{ steps.parse-command.outputs.content_length }}
+          create-pr-comment: 'true'
+          upload-artifact: 'false'
+          create-gist: 'false'
+          gist-visibility: 'private'
+          user-context-comment: |
+            Generated from slash command: ${{ steps.parse-command.outputs.command_type }}
+        env:
+          # Use PAT for private MCP repository access, fallback to default token
+          GITHUB_TOKEN: ${{ secrets.MCP_GITHUB_TOKEN || github.token }}
+          # Azure OpenAI Configuration
+          LLM_PROVIDER: azure
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          # MCP Integration
+          MCP_TECHNICAL_WRITER_ENABLED: ${{ vars.MCP_TECHNICAL_WRITER_ENABLED }}
+          MCP_TECHNICAL_WRITER_SERVER_PATH: ${{ vars.MCP_TECHNICAL_WRITER_SERVER_PATH }}
+          MCP_SERVER_REPOSITORY: ${{ vars.MCP_SERVER_REPOSITORY || 'elastic/tech-writer-mcp' }}
+          # Elasticsearch for MCP
+          ELASTICSEARCH_HOST: ${{ secrets.ELASTICSEARCH_HOST }}
+          ELASTICSEARCH_USERNAME: ${{ secrets.ELASTICSEARCH_USERNAME }}
+          ELASTICSEARCH_PASSWORD: ${{ secrets.ELASTICSEARCH_PASSWORD }}
+          ELASTICSEARCH_INDEX: ${{ vars.ELASTICSEARCH_INDEX || 'content-github-b0b7' }}
+          # IMMEDIATE FIX: Elastic Cloud ELSER timeout configuration
+          ELASTICSEARCH_ELSER_TIMEOUT: 60
+          ELASTICSEARCH_REQUEST_TIMEOUT: 45
+          MCP_ELSER_RETRY_COUNT: 3
+          MCP_MODEL_STARTUP_WAIT: 30
+
+      # For more details on documentation generation, see docs/DOCUMENTATION_GENERATION.md
+
+      # Supported slash commands:
+      # /test-plan [--preset agile|conservative|ui_focused|backend_focused] [--max-tests N] [--enhance]
+      # /e2e-plan [--preset agile] [--max-tests N] [--enhance]
+      # /functional-tests [--preset agile] [--max-tests N] [--enhance]
+      # /generate-docs [--doc-type user_guide|api_reference|technical_spec|release_notes|troubleshooting]
+      #                [--audience developer|user|admin] [--content-length brief|standard|comprehensive]
+      #                [--enhance]
+      #
+      # Examples:
+      # /test-plan --preset conservative --max-tests 15
+      # /generate-docs --doc-type api_reference --audience developer --content-length comprehensive
+      # /generate-docs --doc-type user_guide --audience user
+
+      # Test plan/documentation is posted as PR comment - no artifacts needed for this simple use case
+
+      - name: React with success/failure
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get the success status, default to false if empty or undefined
+            const successOutput = '${{ steps.test-plan.outputs.success }}';
+            const success = successOutput === 'true';
+            const reaction = success ? '+1' : '-1';
+
+            console.log(`Success output: "${successOutput}", Success boolean: ${success}, Reaction: ${reaction}`);
+
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: reaction
+            });
+
+      # Action handles PR comment creation and MCP integration internally - no additional steps needed
+
+# ===============================================================================
+# CONFIGURATION GUIDE
+# ===============================================================================
+
+# REQUIRED REPOSITORY SECRETS:
+# ---------------------------
+# The following secrets must be configured in repository settings > Secrets and variables > Actions:
+#
+# MCP_GITHUB_TOKEN (REQUIRED for private MCP repository access):
+#   Personal Access Token (PAT) with read access to the MCP server repository
+#   Setup instructions:
+#   1. Go to GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens
+#   2. Click "Generate new token"
+#   3. Select the repository owner (e.g., "elastic")
+#   4. Grant "Contents: Read" permission for the MCP server repository (e.g., elastic/tech-writer-mcp)
+#   5. Copy the generated token and add it as a repository secret named "MCP_GITHUB_TOKEN"
+#   Note: If MCP_GITHUB_TOKEN is not provided, workflow will fallback to default GITHUB_TOKEN (public repos only)
+#
+# Azure OpenAI Configuration:
+# - AZURE_OPENAI_API_KEY: Your Azure OpenAI API key
+# - AZURE_OPENAI_ENDPOINT: Your Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com/)
+# - AZURE_OPENAI_DEPLOYMENT: Your Azure OpenAI deployment name
+#
+# MCP Server & Elasticsearch (for documentation generation):
+# - ELASTICSEARCH_HOST: Elasticsearch cluster URL (e.g., https://your-cluster.es.region.gcp.elastic-cloud.com)
+# - ELASTICSEARCH_USERNAME: Elasticsearch username for authentication
+# - ELASTICSEARCH_PASSWORD: Elasticsearch password for authentication
+
+# REQUIRED REPOSITORY VARIABLES:
+# -----------------------------
+# The following variables should be configured in repository settings > Secrets and variables > Actions:
+#
+# MCP_SERVER_REPOSITORY: Repository path for the technical-writer-mcp server (REQUIRED for MCP functionality)
+#   Format: "owner/repository-name" (without github.com prefix)
+#   Examples:
+#     - "your-org/technical-writer-mcp"
+#     - "company/custom-mcp-server"
+#   Default: "your-org/technical-writer-mcp" (update this!)
+#   Note:
+#     - For private repositories, ensure the GITHUB_TOKEN has read access
+#     - Do not include "https://github.com/" prefix or ".git" suffix
+#     - The repository will be cloned at runtime using GitHub's authentication
+#
+# MCP_TECHNICAL_WRITER_ENABLED: Enable/disable MCP integration globally
+#   Values: "true" or "false"
+#   Default: "true"
+#
+# MCP_TECHNICAL_WRITER_SERVER_PATH: Path where MCP server will be installed
+#   Note: This is set to "/app/mcp-server" by default and managed automatically
+#
+# ELASTICSEARCH_INDEX: Elasticsearch index name for document search
+#   Example: "content-github-b0b7"
+#   Default: "content-github-b0b7"
+
+# PERMISSIONS REQUIRED:
+# --------------------
+# Ensure the workflow has the following permissions (configured above):
+# - contents: read (to checkout repository code)
+# - pull-requests: write (to post comments on PRs)
+# - issues: write (to react to issue comments)
+
+# MCP SERVER REQUIREMENTS:
+# -----------------------
+# The technical-writer-mcp repository must:
+# 1. Be accessible by the GitHub Actions runner using GITHUB_TOKEN (public or private with read access)
+# 2. Have ONE of the following dependency management setups:
+#    - pyproject.toml (for uv-based setup) + server.py entry point
+#    - requirements.txt (for pip-based setup) + technical_writer_mcp module structure
+#    - standalone server.py file that can run directly
+# 3. Accept environment variables for Elasticsearch configuration:
+#    - ELASTICSEARCH_HOST, ELASTICSEARCH_USERNAME, ELASTICSEARCH_PASSWORD, ELASTICSEARCH_INDEX
+# 4. Follow MCP best practices:
+#    - Use stderr for logging (stdout reserved for MCP protocol)
+#    - Start within 30 seconds and indicate readiness in logs
+#    - Handle graceful shutdown when receiving termination signals
+
+# TROUBLESHOOTING:
+# ---------------
+# If documentation generation fails:
+# 1. Check that all Elasticsearch secrets are correctly configured
+# 2. Verify MCP_SERVER_REPOSITORY points to the correct repository
+# 3. Ensure the MCP server repository has the expected dependency files
+# 4. Check workflow logs for specific error messages
+# 5. The workflow will automatically fallback to template-only generation if MCP setup fails
+#
+# ELASTIC CLOUD ELSER ISSUES:
+# ---------------------------
+# If you get ELSER model timeout errors (common with Elastic Cloud):
+# 1. The workflow now includes automatic ELSER model pre-warming
+# 2. Timeout values have been increased to 60 seconds for model startup
+# 3. The pre-warm step will start the model before documentation generation
+# 4. If issues persist, check your Elastic Cloud ML node resources
+# 5. You can disable MCP temporarily by setting MCP_TECHNICAL_WRITER_ENABLED=false
+#
+# Repository Access Issues:
+# - If you get "Repository not found" or "fatal: repository not found" errors:
+#   a) MOST COMMON: Private repository access issue - ensure MCP_GITHUB_TOKEN secret is configured
+#   b) Check that MCP_SERVER_REPOSITORY variable points to the correct repository (format: "owner/repo")
+#   c) Verify the MCP repository actually exists and is accessible
+#   d) For organization repositories, ensure the PAT has access to the specific repository
+#
+# - If cloning fails with authentication errors:
+#   a) Verify MCP_GITHUB_TOKEN secret is properly configured with "Contents: Read" permissions
+#   b) Check that the PAT hasn't expired
+#   c) Ensure the PAT has access to the specific repository (not just general org access)
+#   d) For troubleshooting, check if the repository is private vs public
+#
+# - If MCP server setup fails after successful clone:
+#   a) Check if the repository has pyproject.toml, requirements.txt, or server.py
+#   b) Verify the MCP server follows the expected structure
+#   c) Check MCP server logs in workflow output for specific error messages
+
+# TESTING THE SETUP:
+# -----------------
+# To test MCP integration:
+# 1. First, ensure MCP_GITHUB_TOKEN secret is configured (see setup instructions above)
+# 2. Comment on a PR with: /generate-docs --doc-type user_guide
+# 3. Check the workflow logs for MCP server setup messages:
+#    - Look for "🔧 Setting up MCP server at runtime..."
+#    - Should see "✅ MCP server repository cloned successfully"
+#    - Should see "✅ MCP server is running and healthy"
+# 4. If MCP fails, the workflow should still succeed with template generation
+#
+# To test without MCP:
+# 1. Set MCP_TECHNICAL_WRITER_ENABLED variable to "false"
+# 2. Comment with: /generate-docs --doc-type user_guide
+# 3. Should see "ℹ️ MCP server disabled" in logs
+#
+# Common test scenarios:
+# - /generate-docs (basic documentation with MCP)
+# - /generate-docs --doc-type api_reference --audience developer (specific doc type)
+# - /test-plan --preset agile --enhance (test plan with MCP enhancement)
